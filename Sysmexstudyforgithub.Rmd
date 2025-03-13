@@ -1,0 +1,336 @@
+---
+title: "Sysmexstudyforthepaper"
+author: "Kristin Wickstrøm"
+date: "2025-03-05"
+output: html_document
+---
+
+## Sysmex study
+
+In this script the codes used in the Sysmex study is shown.
+
+First, installing and loading libraries.
+```{r load libraries}
+install.packages(c("readxl","dplyr","ggplot2", "pROC","mice","nnet","randomForest", "boot","probably","CalibrationCurves","klaR","gbm"))
+library(ggplot2)
+library(readxl)
+library(dplyr)
+library(pROC)
+library(mice)
+library(randomForest)
+library(boot)
+library(klaR)
+library(gbm)
+library(CalibrationCurves)
+```
+
+Loading datasets. 
+```{r load datasets}
+#development dataset devdata and validation dataset valdata is loaded.
+devdata <- load("devdata.csv")
+valdata <- load("valdata.csv")
+```
+
+## Imputation
+
+```{r imputation}
+imputatedsep <- list()
+m <- 11  #plot the number of imputed datasets, recommended to be the number of cases in the dataset with missing values
+imputatedsep = mice(devdata, m= m, method=c("pmm"), maxit=20) #run imputations
+
+```
+
+#run predictor selection and LASSO for selection of variables
+
+```{r predictor selection}
+
+#chose the outcome- under listed "infeksjon"
+#make two lists to hold imputed datasets and selected variables from backward selection
+selected_variables_list <- list()
+imputed_data_list <- list()
+
+#make m complete dataset based on imputed datasets and they are called sepsisimp
+for (i in 1:m) {
+  imputed_data_list[[i]] <- complete(imputatedsep, i)
+}
+#run backward selection on each imputed dataset and keep the resulting variables
+for (i in 1:length(imputed_data_list)) {
+  model <- glm(infeksjon ~ ., data = imputed_data_list[[i]], family = binomial)
+  backwards <- stepAIC(model, direction = "backward", trace = FALSE)
+  selected_variables <- names(coef(backwards))
+  
+  # save the variables
+  selected_variables_list[[i]] <- setdiff(selected_variables, "(Intercept)")
+}
+#look at the variables
+View(selected_variables_list)
+
+# bind the results in a table
+variable_frequency <- table(unlist(selected_variables_list))
+
+# convert to a dataframe for an easier datahandling
+variable_frequency_df <- as.data.frame(variable_frequency)
+colnames(variable_frequency_df) <- c("variable", "frequency")
+
+# count the frequency in percent
+variable_frequency_df$percentage <- (variable_frequency_df$frequency / length(imputed_data_list)) * 100
+
+#filter in the variables that are available over 50% 
+selected_variables_final <- variable_frequency_df$variable[variable_frequency_df$percentage > 50]
+
+# look at the results
+print(variable_frequency_df)
+print(selected_variables_final)
+#print the results
+write.csv(selected_variables_final,"selected_variablesbackwards.csv")
+
+#select a model that only includes the variables that are included in more than 50% of the backward selections and run the model on backward selection with Wald statistics 
+sysmodell <- devdata[, !names(devdata) %in% c("igpro","lyz","ig","lyy","moy","newz","lywx","lywz","lywy","mowx","aslymf","aslymfpro","relymfpro","infeksjon")]
+
+# run the model on the chosen variables
+model <- glm(infeksjon ~ ., data=sysmodell, family=binomial)
+
+# function for backward selection with the use of Wald statistics
+backward_selection_wald <- function(mod) {
+  while(TRUE) {
+    # Hent p-verdier for alle koeffisientene som ikke er intercept
+    p_values <- summary(mod)$coefficients[-1, "Pr(>|z|)"]
+    # Finn maksimum p-verdi og tilhørende variabel
+    max_p <- max(p_values)
+    max_var <- names(p_values)[which.max(p_values)]
+    
+    # Hvis største p-verdi er statistisk signifikant (her bruker vi alfa = 0.05), stopp
+    if (max_p < 0.05) {
+      break
+    } else {
+      # Hvis ikke, fjern denne variabelen fra modellen og oppdater modellen
+      formula <- as.formula(paste("infeksjon ~ . -", max_var))
+      mod <- update(mod, formula)
+    }
+  }
+  return(mod)
+}
+
+# backward selection with Wald modell on the second model
+final_model <- backward_selection_wald(model)
+
+# look at the final model
+summary(final_model)
+
+#save the results
+run_settings <- list()
+run_settings$run_date <- format(Sys.time(), "%Y%m%d_%H%M")
+ #Angi folder path
+run_settings$run_dir <- paste0("~/sysmexdata/", "run_", run_settings$run_date)
+folder_path <- run_settings$run_dir
+
+ #Sjekk om mappen eksisterer, og hvis ikke, opprett den.
+if (!dir.exists(folder_path)) {
+  dir.create(folder_path, recursive = TRUE)
+}
+
+# save the file
+filepathrds <- file.path(folder_path, "finalmodelbackwards.rds")
+saveRDS(final_model, filepathrds)
+summary(finalmodelbackwards)
+
+####LASSO REGRESSION
+# make lists to hold the results
+lasso_coefs <- list()
+non_zero_counts <- NULL
+selected_vars <- list()
+
+# run LASSO-regression on each imputed dataset
+for (i in 1:m) {
+  # Hent det imputerte datasettet
+  imputed <- complete(imputatedsepsys, i)
+  
+  # Forbered data for LASSO
+  x <- model.matrix(infeksjon ~ ., imputed)[, -1]
+  y <- imputed$infeksjon
+  
+  # Kjør LASSO-regresjon
+  lasso_fit <- cv.glmnet(x, y, family = "binomial", alpha = 1)
+  
+  # Hent koeffisienter fra beste lambda
+  best_lambda <- lasso_fit$lambda.min
+  se_lambda <- lasso_fit$lambda.1se
+  lasso_model <- glmnet(x, y, family = "binomial", alpha = 1, lambda = se_lambda)
+  coefs <- as.matrix(coef(lasso_model))
+  
+  # Lagre resultatene
+  lasso_coefs[[i]] <- coefs
+  
+  # Tell ikke-null koeffisienter
+  non_zero <- coefs != 0
+  if (is.null(non_zero_counts)) {
+    non_zero_counts <- non_zero
+  } else {
+    non_zero_counts <- non_zero_counts + non_zero
+  }
+}
+
+# Combine results: chose coeffisients that are in 50% of the results
+selected_vars <- rownames(lasso_coefs[[1]])[rowSums(non_zero_counts) > (0.5 * 10)]
+selected_vars
+plot(lasso_fit)
+
+#Analyze the chosen coeffisients
+
+cat("Variables in over 50% of the results are:\n")
+print(selected_vars)
+#save the results
+write(selected_vars,"lassoselected.csv")
+
+# final model based on these variables
+final_formula <- as.formula(paste("infeksjon ~", paste(selected_vars[-1], collapse = " + ")))  # '-1' fjerner intercept
+final_formula
+final_model2 <- glm(final_formula, data = devdata, family = binomial)
+
+summary(final_model2)
+
+# save the file
+filepathrds <- file.path(folder_path, "finalmodellasso.rds")
+saveRDS(final_model2, filepathrds)
+```
+
+```{r develop models}
+#call the data -data
+data=devdata
+#chosen model either univariate or multivariate, copy it in the function further down
+"mox + moz + nesfl + nefsc"
+#this is for the "i" in the function under
+ind <- sample(nrow(data), size = nrow(data), replace = TRUE)
+
+#make a function that generate a model 
+  aucd <- function(data,i){
+  index <- i
+  m1 <- glm(infeksjon ~ mox + moz + nesfl + nefsc, family = binomial, data[index,]) #plot the variables for the model that is chosen here and the outcome
+  # train 
+  predictions <- predict(m1, data[index,]) 
+  roc_object <- roc(data[index,]$infeksjon, predictions)
+  D_train <- auc(roc_object)          ###train AUC based on the bootstrap dataset
+  #test
+  predictions2 <- predict(m1, data)
+  roc_object2 <- roc(data$infeksjon, predictions2)
+  D_test <- auc(roc_object2)          ### train AUC based on the dataset
+  print(D_train)
+  print(D_test)
+  print(D_train - D_test)           ##difference of AUC from bootstrap and AUC from dataset
+}
+#run the function on data
+aucd(data, ind)
+#bootstrap it 200 times to get the optimism estimate
+sd.out <- boot(data = data, statistic = aucd, R = 200)
+#plot the chosen variables and outcome under
+orig <- glm(infeksjon ~  mox + moz + nesfl + nefsc, family = binomial, 
+            data = data)
+predictions <- predict(orig, data, type="response") 
+roc_object <- roc(data$infeksjon, predictions)
+plot(roc_object, col="red")
+D_orig <- auc(roc_object)
+D_orig
+orig
+D_orig - mean(sd.out$t) #subtract the optimisme from the original AUC from the model
+mean(sd.out$t) # mean of the optimism estimat 
+ci.auc(data$infeksjon, predictions, method=c("bootstrap"), boot.n = 200)
+sd.out
+
+
+###validation of the model that is developed
+predictions2 <- predict(orig, newdata=valdata, type= "response")
+#predictions2 from validation dataset from the development model
+roc_object4 <- roc(valdata$infeksjon, predictions2)
+aucval <- auc(roc_object4)
+aucval #create AUC from validation and CI under
+ci.auc(valdata$infeksjon, predictions2, method=c("bootstrap"), boot.n = 200)
+
+```
+
+```{r calibration plots}
+#calibration plots for the development cohort
+devdata$predictions <- predictions
+devdata %>% 
+  cal_plot_logistic(infeksjon, predictions, smooth = TRUE, step_size = 0.025)
+
+#calibration plots for the validation cohort
+valdata$predictions <- predictions2
+valdata$infeksjon <- as.numeric(valdata$infeksjon)
+valdata %>% 
+  cal_plot_logistic(infeksjon, predictions, smooth = TRUE)
+```
+
+
+```{r hosmer lewenshow test}
+#Kruskal Wallis
+#plot the outcome-> here it is "infeksjon" and the variable- here "mox"
+result <- kruskal.test(infeksjon ~ mox, data = sys4)
+```
+
+```{r machine learning models}
+#Under is the machine learning models that we have used listed. They have been used in the chunk over {r develop models} where the logistic regression model is replaced by the ML method that is used
+
+#Random forest function
+orig <- randomForest(infeksjon ~ nesfl + nefsc + mox + moz, data, mtry=5, ntree = 500)
+
+#KNN model
+#find the optimal k
+ctrl <- trainControl(method="repeatedcv", repeats = 3) 
+m <- train(infeksjon ~ nesfl + nefsc + mox + moz, data[index,], method = "knn", trControl = ctrl, preProcess = c("center","scale"), tuneLength = 20)
+
+#naive bayes
+m <- train(infeksjon ~ nessc + nesfl + nefsc + mox + moz + newx + mowy, data[index,], method = "nb",
+  trControl = trainControl(method = "cv", number = 5),
+  tuneGrid = tune_grid)
+
+
+
+
+#Gradient boosting
+
+# Define train control for cross-validation
+train_control <- trainControl(method="cv", number=5, search="grid")
+# Define the hyperparameter grid
+tune_grid <- expand.grid(
+  n.trees = c(100, 200),
+  interaction.depth = c(1, 3, 5),
+  shrinkage = c(0.01, 0.1),
+  n.minobsinnode = c(10, 20)
+)
+# Perform grid search to find optimal hyperparameters
+grid_search_result <- train(
+  infeksjon ~ mox + moz + nesfl + nefsc,
+  data = data,
+  method = "gbm",
+  trControl = train_control,
+  tuneGrid = tune_grid,
+  verbose = FALSE
+)
+
+# Print grid search result to find optimal hyperparameters
+print(grid_search_result)
+
+# Extract optimal parameters
+best_params <- grid_search_result$bestTune
+
+# Train the final model using optimal parameters
+final_model <- train(
+  infeksjon ~ mox + moz + nesfl + nefsc,
+  data = data,
+  method = "gbm",
+  trControl = trainControl(method = "none"),
+  tuneGrid = best_params,
+  verbose = FALSE
+)
+###this code under is implemented in the chunk {r develop models}
+m <- train(
+    infeksjon ~ mox + moz + nesfl + nefsc,
+    data = data[index,],
+    method = "gbm",
+    trControl = trainControl(method = "none"),
+    tuneGrid = best_params,
+    verbose = FALSE
+  )
+
+```
+
